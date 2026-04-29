@@ -3,6 +3,45 @@
 > 主要依据 OpenJDK `java.util` 与 `java.util.concurrent` 源码。  
 > 重点关注：线程安全策略、底层结构、扩容/缩容机制。
 
+## 0. 先建立整体认知
+
+### 0.1 为什么会有这么多线程安全集合
+
+Java 里的线程安全集合并不是“换个类名而已”，而是针对不同并发场景做了不同取舍：
+
+- 有的追求**实现简单**，直接用粗粒度锁，例如 `Vector`、`Hashtable`
+- 有的追求**兼容老接口**，只是给普通集合加同步外壳，例如 `Collections.synchronizedX`
+- 有的追求**高并发吞吐**，用 CAS、桶级锁、协作扩容，例如 `ConcurrentHashMap`
+- 有的追求**读多写少**，用写时复制，例如 `CopyOnWriteArrayList`
+- 有的服务于**生产者-消费者/阻塞等待**，例如 `ArrayBlockingQueue`、`LinkedBlockingQueue`
+- 有的服务于**排序、延迟、传输、有序结构**，例如 `PriorityBlockingQueue`、`DelayQueue`、`ConcurrentSkipListMap`
+
+所以面试里不要只背“谁线程安全”，而要回答清楚：
+
+- 它靠什么保证线程安全
+- 它牺牲了什么
+- 它适合什么场景
+
+### 0.2 面试最高频的几组对比
+
+- `Vector` vs `ArrayList`
+- `Hashtable` vs `HashMap`
+- `Collections.synchronizedMap` vs `ConcurrentHashMap`
+- `CopyOnWriteArrayList` 适用场景与缺点
+- `ArrayBlockingQueue` vs `LinkedBlockingQueue`
+- `ConcurrentHashMap` vs `ConcurrentSkipListMap`
+
+如果把这几组对比说顺了，这个专题的大部分面试题就能接住。
+
+### 0.3 本文建议阅读顺序
+
+如果你是为了面试复习，建议按这个顺序看：
+
+1. 先看 **总览分类**，建立地图
+2. 再看 **各集合源码级结论**，理解每类容器的线程安全策略
+3. 再看 **扩容/缩容模式归纳** 和 **最容易混淆的几点**，建立横向比较能力
+4. 最后看文末的 **选型建议 / 面试问法 / 速记版**，把知识变成可表达内容
+
 ---
 
 ## 1. 总览分类
@@ -23,6 +62,29 @@
 | 传输队列 | `LinkedTransferQueue` | 无锁链表/双队列 | CAS + 匹配节点 | 无界，按节点增长；无缩容 |
 | 并发有序 Map | `ConcurrentSkipListMap` | 跳表 | CAS + 无锁风格遍历/更新 | 节点按需增长；删除时会尝试降低顶层高度 |
 | 并发有序 Set | `ConcurrentSkipListSet` | 基于 `ConcurrentSkipListMap` | 同上 | 同上 |
+
+### 1.1 一句话分类记忆
+
+- **老同步容器**：`Vector`、`Hashtable`
+- **同步包装器**：`Collections.synchronizedX`
+- **高并发 Map**：`ConcurrentHashMap`
+- **读多写少容器**：`CopyOnWriteArrayList/Set`
+- **无锁队列**：`ConcurrentLinkedQueue`、`LinkedTransferQueue`
+- **阻塞队列**：`ArrayBlockingQueue`、`LinkedBlockingQueue`、`PriorityBlockingQueue`、`DelayQueue`
+- **有序并发结构**：`ConcurrentSkipListMap/Set`
+
+### 1.2 先给结论：面试中如何快速选型
+
+| 场景 | 优先考虑 | 原因 |
+|---|---|---|
+| 高频并发读写 KV | `ConcurrentHashMap` | 读基本无锁，写锁粒度小，吞吐高 |
+| 读远多于写 | `CopyOnWriteArrayList` | 读无锁且快，写时整体复制 |
+| 需要固定容量和背压 | `ArrayBlockingQueue` | 有界、内存更可控 |
+| 需要较高吞吐的阻塞队列 | `LinkedBlockingQueue` | 链表按需增长，双锁降低竞争 |
+| 需要优先级出队 | `PriorityBlockingQueue` | 堆结构，按优先级出队 |
+| 需要按到期时间出队 | `DelayQueue` | 基于延迟时间排序 |
+| 需要有序 Map | `ConcurrentSkipListMap` | 跳表，天然有序 |
+| 只是临时给旧集合加同步 | `Collections.synchronizedX` | 兼容性方案，不是高并发优化方案 |
 
 ---
 
@@ -868,30 +930,133 @@ flowchart TD
 
 ---
 
-## 4. 最容易混淆的几点
+## 4. 高频选型对比
 
-### 4.1 ConcurrentHashMap 不会因为 remove 自动缩容
-- 它会扩容、会树化、会在某些场景 untreeify
-- 但不会像某些缓存实现那样自动缩 table
+### 4.1 `Hashtable` vs `Collections.synchronizedMap` vs `ConcurrentHashMap`
 
-### 4.2 CopyOnWriteArrayList 的“扩容”不是 ArrayList 那种扩容
-- 它不是预留富余容量
-- 而是每次写都重新分配恰好需要的新数组
+| 对比项 | `Hashtable` | `Collections.synchronizedMap` | `ConcurrentHashMap` |
+|---|---|---|---|
+| 本质 | 老同步容器 | 同步包装器 | 高并发 Map |
+| 线程安全方式 | 方法级 `synchronized` | 统一 `mutex` 同步 | CAS + bin 锁 + 协作扩容 |
+| 锁粒度 | 整体较粗 | 整体较粗 | 桶级别更细 |
+| 并发性能 | 低 | 取决于底层，但整体锁竞争明显 | 高 |
+| 是否允许 `null` | 不允许 | 取决于底层 Map | 不允许 |
+| 面试结论 | 了解历史即可 | 兼容性方案 | 并发场景首选 |
 
-### 4.3 LinkedBlockingQueue 不是“会扩容的数组队列”
-- 它本质是链表
-- 未设容量时只是近似无界，不叫数组扩容
+### 4.2 `Vector` vs `Collections.synchronizedList` vs `CopyOnWriteArrayList`
 
-### 4.4 DelayQueue 的容量行为来自 PriorityQueue
-- DelayQueue 只是并发/阻塞/过期语义外壳
-- 存储仍是优先堆
+| 对比项 | `Vector` | `Collections.synchronizedList` | `CopyOnWriteArrayList` |
+|---|---|---|---|
+| 本质 | 老同步容器 | 同步包装器 | 写时复制容器 |
+| 线程安全方式 | 方法级 `synchronized` | 包装器统一加锁 | 读直接读数组，写时整体复制 |
+| 读性能 | 一般 | 一般 | 很高 |
+| 写性能 | 一般 | 一般 | 较差 |
+| 适用场景 | 历史代码 | 给旧 List 快速加同步 | 读多写少 |
+| 面试结论 | 知道即可 | 不是高并发优化方案 | 不适合频繁写 |
 
-### 4.5 ConcurrentSkipListMap 的“缩容”是降层，不是收缩数组
-- 这是结构高度优化，不是 hash table resize-down
+### 4.3 `ArrayBlockingQueue` vs `LinkedBlockingQueue`
+
+| 对比项 | `ArrayBlockingQueue` | `LinkedBlockingQueue` |
+|---|---|---|
+| 底层结构 | 循环数组 | 链表 |
+| 容量 | 固定有界 | 可选有界，默认近乎无界 |
+| 锁模型 | 单锁 | `putLock/takeLock` 双锁 |
+| 内存特征 | 更稳定、更可控 | 节点对象更多 |
+| 适用场景 | 明确需要背压、控内存 | 更通用的阻塞生产消费 |
+| 面试结论 | 有界队列首选 | 默认无界要注意堆积风险 |
+
+### 4.4 `ConcurrentHashMap` vs `ConcurrentSkipListMap`
+
+| 对比项 | `ConcurrentHashMap` | `ConcurrentSkipListMap` |
+|---|---|---|
+| 结构 | hash 桶 | 跳表 |
+| 是否有序 | 无序 | 有序 |
+| 查询性能 | 平均 O(1) | O(log n) |
+| 并发方式 | CAS + bin 锁 | CAS + 跳表无锁风格遍历/更新 |
+| 适用场景 | 高频并发 KV | 需要有序范围查询 |
+| 面试结论 | 默认并发 Map 首选 | 需要排序能力时再选 |
 
 ---
 
-## 5. 一句话结论
+## 5. 最容易混淆的几点
+
+### 5.1 ConcurrentHashMap 不会因为 remove 自动缩容
+- 它会扩容、会树化、会在某些场景 untreeify
+- 但不会像某些缓存实现那样自动缩 table
+
+### 5.2 CopyOnWriteArrayList 的“扩容”不是 ArrayList 那种扩容
+- 它不是预留富余容量
+- 而是每次写都重新分配恰好需要的新数组
+
+### 5.3 LinkedBlockingQueue 不是“会扩容的数组队列”
+- 它本质是链表
+- 未设容量时只是近似无界，不叫数组扩容
+
+### 5.4 DelayQueue 的容量行为来自 PriorityQueue
+- DelayQueue 只是并发/阻塞/过期语义外壳
+- 存储仍是优先堆
+
+### 5.5 ConcurrentSkipListMap 的“缩容”是降层，不是收缩数组
+- 这是结构高度优化，不是 hash table resize-down
+
+### 5.6 线程安全容器不等于复合操作天然安全
+- 容器线程安全，通常只保证**单次操作**安全
+- 例如 `containsKey + put`、`get + if + put` 仍可能有竞态条件
+- 真正需要原子复合语义时，要优先使用：
+  - `putIfAbsent`
+  - `computeIfAbsent`
+  - `replace`
+  - `remove(key, value)`
+
+### 5.7 `Collections.synchronizedX` 迭代时仍要手动同步
+- 它只是给每个方法加同步，不代表“整个遍历过程自动安全”
+- 如果边遍历边可能有并发修改，通常还需要在外层对同一个 `mutex` 手动同步
+
+### 5.8 `CopyOnWriteArrayList` 不是“高并发写优化容器”
+- 它优化的是**读**，不是写
+- 写越频繁，数组复制成本越高
+
+### 5.9 `LinkedBlockingQueue` 默认容量很大，不等于适合无限堆积
+- 默认容量近乎 `Integer.MAX_VALUE`
+- 如果生产速度长期高于消费速度，可能带来明显内存压力
+
+---
+
+## 6. 高频面试问法
+
+### 6.1 `ConcurrentHashMap` 为什么比 `Hashtable` 并发性能更好
+
+回答模板：
+
+> `Hashtable` 基本是方法级 `synchronized`，锁粒度比较粗；而 `ConcurrentHashMap` 在 JDK 8 之后主要通过 CAS、桶级锁和协作扩容来提升并发度。它读操作通常无锁，写操作只锁单个 bin，不会像 `Hashtable` 那样把整张表串行化，所以高并发下吞吐明显更高。
+
+### 6.2 `ConcurrentHashMap` 为什么不允许 `null`
+
+回答模板：
+
+> 因为在并发环境下，如果 `get(key)` 返回 `null`，就无法区分是“key 不存在”还是“value 本身就是 null”。为了避免语义歧义，`ConcurrentHashMap` 直接禁止 `null key` 和 `null value`。
+
+### 6.3 `CopyOnWriteArrayList` 适合什么场景
+
+回答模板：
+
+> 它适合读多写少场景。因为读操作直接读取底层数组，几乎无锁，性能很好；但写操作需要复制整个数组，所以写成本高、内存开销也大。如果写很频繁，就不适合用它。
+
+### 6.4 `ArrayBlockingQueue` 和 `LinkedBlockingQueue` 怎么选
+
+回答模板：
+
+> 如果更关注容量可控、内存稳定和背压，优先选 `ArrayBlockingQueue`；如果更关注通用性和吞吐，常用 `LinkedBlockingQueue`。不过 `LinkedBlockingQueue` 默认容量非常大，生产消费不平衡时更容易积压数据。
+
+### 6.5 `Collections.synchronizedMap` 和 `ConcurrentHashMap` 的区别
+
+回答模板：
+
+> `Collections.synchronizedMap` 本质上只是给底层 Map 套了统一锁，属于兼容性方案；`ConcurrentHashMap` 是专门为并发场景设计的数据结构，锁粒度更细，并发性能更好。所以真正的高并发场景通常选 `ConcurrentHashMap`，而不是 `synchronizedMap`。
+
+---
+
+## 7. 一句话结论
 
 如果只记一条：
 
@@ -906,7 +1071,39 @@ flowchart TD
 
 ---
 
-## 6. 参考源码文件
+## 8. 一页速记版
+
+### 8.1 线程安全集合选型口诀
+
+- **并发 Map 默认先想 `ConcurrentHashMap`**
+- **读多写少先想 `CopyOnWriteArrayList`**
+- **要背压、控容量先想 `ArrayBlockingQueue`**
+- **要通用阻塞队列常看 `LinkedBlockingQueue`**
+- **要排序用 `PriorityBlockingQueue`**
+- **要按过期时间出队用 `DelayQueue`**
+- **要有序 Map 用 `ConcurrentSkipListMap`**
+- **老同步容器和 synchronized 包装器更多是历史/兼容方案**
+
+### 8.2 高频关键词映射
+
+- **粗粒度锁**：`Vector`、`Hashtable`
+- **同步包装器**：`Collections.synchronizedX`
+- **CAS + 桶锁**：`ConcurrentHashMap`
+- **写时复制**：`CopyOnWriteArrayList/Set`
+- **无锁链表队列**：`ConcurrentLinkedQueue`、`LinkedTransferQueue`
+- **阻塞队列**：`ArrayBlockingQueue`、`LinkedBlockingQueue`
+- **堆队列**：`PriorityBlockingQueue`、`DelayQueue`
+- **跳表**：`ConcurrentSkipListMap/Set`
+
+### 8.3 最后记住三个大原则
+
+1. 线程安全集合的核心差异，不只是“加不加锁”，而是**锁粒度、读写模型、是否有界、是否有序**。
+2. 没有绝对最好的线程安全集合，只有**最适合当前并发场景**的集合。
+3. 面试回答不要只说“它线程安全”，要继续补：**怎么保证、适合什么场景、代价是什么**。
+
+---
+
+## 9. 参考源码文件
 
 - `java/util/Vector.java`
 - `java/util/Hashtable.java`

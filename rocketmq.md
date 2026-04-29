@@ -246,6 +246,35 @@ ConsumerGroup: order-audit-group
 - **不同消费组之间彼此独立**
 - **同一消费组内多个实例用于分摊负载**
 
+#### 一个 Topic 被多个 ConsumerGroup 同时消费的图解
+
+```mermaid
+flowchart LR
+    T[Topic: order-event] --> G1[ConsumerGroup: inventory-group]
+    T --> G2[ConsumerGroup: notify-group]
+    T --> G3[ConsumerGroup: audit-group]
+
+    G1 --> C11[Consumer A]
+    G1 --> C12[Consumer B]
+
+    G2 --> C21[Consumer C]
+
+    G3 --> C31[Consumer D]
+    G3 --> C32[Consumer E]
+```
+
+这个图表示：
+
+- 同一个 Topic 可以被多个 ConsumerGroup 同时订阅
+- 每个 ConsumerGroup 都会独立获得自己的一份消息流
+- 组内多个 Consumer 实例只是在共享本组的消费负载
+- 组与组之间不会共享消费位点
+
+因此：
+
+- “发通知”和“扣库存”应该是不同 ConsumerGroup
+- “同一个业务扩容”才应该在同一个 ConsumerGroup 里加实例
+
 ### 3.5.2 ConsumerGroup 配置的正确与错误示例
 
 #### 正确示例 1：不同业务使用不同 ConsumerGroup
@@ -660,6 +689,115 @@ rocketMQTemplate.sendMessageInTransaction(...)
 - `executeLocalTransaction`
 - `checkLocalTransaction`
 
+#### Spring Boot 事务消息代码示例
+
+发送端示例：
+
+```java
+import org.apache.rocketmq.client.producer.SendResult;
+import org.apache.rocketmq.common.message.MessageConst;
+import org.springframework.messaging.Message;
+import org.springframework.messaging.support.MessageBuilder;
+import org.springframework.stereotype.Service;
+import org.apache.rocketmq.spring.core.RocketMQTemplate;
+
+@Service
+public class OrderTransactionProducer {
+
+    private final RocketMQTemplate rocketMQTemplate;
+
+    public OrderTransactionProducer(RocketMQTemplate rocketMQTemplate) {
+        this.rocketMQTemplate = rocketMQTemplate;
+    }
+
+    public SendResult createOrder(Long orderId) {
+        Message<String> message = MessageBuilder.withPayload("order-created:" + orderId)
+                .setHeader(MessageConst.PROPERTY_KEYS, "ORDER_" + orderId)
+                .build();
+
+        // 第三个参数通常传业务参数，供本地事务执行时使用
+        return rocketMQTemplate.sendMessageInTransaction(
+                "order-tx-topic",
+                message,
+                orderId
+        );
+    }
+}
+```
+
+本地事务监听器示例：
+
+```java
+import org.apache.rocketmq.spring.annotation.RocketMQTransactionListener;
+import org.apache.rocketmq.spring.core.RocketMQLocalTransactionListener;
+import org.apache.rocketmq.spring.core.RocketMQLocalTransactionState;
+import org.springframework.messaging.Message;
+import org.springframework.stereotype.Component;
+
+@Component
+@RocketMQTransactionListener
+public class OrderTransactionListener implements RocketMQLocalTransactionListener {
+
+    @Override
+    public RocketMQLocalTransactionState executeLocalTransaction(Message msg, Object arg) {
+        Long orderId = (Long) arg;
+        try {
+            // 1. 执行业务本地事务，例如写订单表、冻结库存等
+            // orderService.createOrder(orderId);
+
+            // 2. 本地事务成功，提交事务消息
+            return RocketMQLocalTransactionState.COMMIT;
+        } catch (Exception ex) {
+            // 本地事务失败，回滚事务消息
+            return RocketMQLocalTransactionState.ROLLBACK;
+        }
+    }
+
+    @Override
+    public RocketMQLocalTransactionState checkLocalTransaction(Message msg) {
+        try {
+            // 根据消息 key 或业务参数查询本地事务最终状态
+            // boolean success = orderService.existsSuccessOrder(...);
+            boolean success = true;
+            return success
+                    ? RocketMQLocalTransactionState.COMMIT
+                    : RocketMQLocalTransactionState.ROLLBACK;
+        } catch (Exception ex) {
+            // 状态仍不明确时返回 UNKNOWN，Broker 后续可能继续回查
+            return RocketMQLocalTransactionState.UNKNOWN;
+        }
+    }
+}
+```
+
+消费者示例：
+
+```java
+import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
+import org.apache.rocketmq.spring.core.RocketMQListener;
+import org.springframework.stereotype.Service;
+
+@Service
+@RocketMQMessageListener(topic = "order-tx-topic", consumerGroup = "order-tx-consumer-group")
+public class OrderTransactionConsumer implements RocketMQListener<String> {
+
+    @Override
+    public void onMessage(String message) {
+        // 这里只会收到已提交的事务消息
+        // 消费逻辑仍应保证幂等
+        System.out.println("receive tx msg: " + message);
+    }
+}
+```
+
+代码要点：
+
+- `sendMessageInTransaction` 先发半事务消息
+- `executeLocalTransaction` 决定提交还是回滚
+- `checkLocalTransaction` 用于 Broker 回查
+- 消费者只能消费已提交事务消息
+- 消费端依然必须做幂等控制
+
 ### 7.7 Push / Pull 消费模式
 
 官方 Spring 集成支持：
@@ -969,6 +1107,38 @@ Topic 吞吐高时，网络也可能成为瓶颈，尤其在以下场景：
 - 某些 Queue 积压特别严重
 - Broker 资源长期高位
 
+### 10.10.1 Queue 数、Consumer 实例数、线程数三者关系图
+
+```mermaid
+flowchart TD
+    T[Topic: payment-event] --> Q1[Queue 0]
+    T --> Q2[Queue 1]
+    T --> Q3[Queue 2]
+    T --> Q4[Queue 3]
+
+    subgraph G[ConsumerGroup: payment-group]
+        C1[Consumer 实例 A\n线程数: 2]
+        C2[Consumer 实例 B\n线程数: 2]
+    end
+
+    Q1 --> C1
+    Q2 --> C1
+    Q3 --> C2
+    Q4 --> C2
+```
+
+这个图说明：
+
+- Topic 有多少 Queue，决定了可分配的分片数
+- Consumer 实例数决定了组内可横向扩容到什么程度
+- 线程数决定了实例拿到 Queue 后能否真正并发处理
+
+常见误区：
+
+- **Queue 少，实例再多也没用**
+- **实例多，但线程数太少，也吃不满分配到的 Queue**
+- **线程很多，但业务处理很慢，吞吐仍上不去**
+
 ### 10.11 优化思路
 
 如果一个 Topic 的消费能力不足，通常按以下思路优化：
@@ -978,6 +1148,53 @@ Topic 吞吐高时，网络也可能成为瓶颈，尤其在以下场景：
 3. 再看单条消息处理逻辑是否过重
 4. 再看 Broker / 磁盘 / 网络是否成为瓶颈
 5. 再评估是否需要拆 Topic、拆业务、拆消费组
+
+### 10.12 消息堆积排查 checklist
+
+当某个 Topic 出现消息堆积时，可以按下面顺序排查：
+
+#### A. 先确认是不是消费能力不足
+
+- [ ] Topic 的 Queue 数是否过少
+- [ ] ConsumerGroup 的实例数是否明显少于 Queue 数
+- [ ] 消费线程数是否配置过低
+- [ ] 是否存在大量空闲实例但 Queue 太少的情况
+
+#### B. 再确认是不是单条消费太慢
+
+- [ ] 单条消息处理是否调用了慢 SQL
+- [ ] 是否依赖慢接口 / 不稳定下游服务
+- [ ] 是否在消费逻辑中做了大量同步 I/O
+- [ ] 是否把复杂计算、批处理、事务操作全放在消费线程里
+
+#### C. 再确认是不是失败重试导致堆积
+
+- [ ] 消费失败率是否升高
+- [ ] 是否出现大量重复重试
+- [ ] 是否有异常消息反复卡住队列
+- [ ] 是否缺少死信队列处理机制
+
+#### D. 再看负载是否均衡
+
+- [ ] 是否只有少数 Queue 堆积严重
+- [ ] 顺序消息是否因为热点 key 导致单 Queue 过热
+- [ ] 消息分片是否均匀
+- [ ] 某些 Consumer 实例是否明显负载过高
+
+#### E. 再看 Broker 与基础设施
+
+- [ ] Broker CPU 是否过高
+- [ ] Broker 磁盘 I/O 是否打满
+- [ ] 网络带宽是否成为瓶颈
+- [ ] 主从复制压力是否过大
+- [ ] 是否存在 PageCache 命中率下降等存储抖动
+
+#### F. 最后确认业务设计是否合理
+
+- [ ] 是否把多类完全不同业务混在一个 Topic 中
+- [ ] 是否把多类业务错误地塞进同一个 ConsumerGroup
+- [ ] 是否需要拆 Topic 提高隔离性
+- [ ] 是否需要拆消费组或拆分热点业务
 
 ---
 
